@@ -52,7 +52,7 @@ def health_check():
     return {"status": "ok", "service": "exam-web-converter"}
 
 @app.post("/api/v1/convert")
-async def convert_file(
+def convert_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     from_format: str = Form(alias="from"),
