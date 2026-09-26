@@ -4,11 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
 import uuid
-from pdf2docx import Converter
+import io
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from google.auth.transport.requests import Request
 
 app = FastAPI()
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,6 +23,22 @@ app.add_middleware(
 TEMP_DIR = "temp_uploads"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+
+def get_drive_service():
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Save updated token
+            with open('token.json', 'w') as token:
+                token.write(creds.to_json())
+        else:
+            raise Exception("token.json không hợp lệ. Vui lòng chạy get_token.py để đăng nhập lại.")
+    return build('drive', 'v3', credentials=creds)
+
 def cleanup_files(files):
     for f in files:
         if os.path.exists(f):
@@ -30,20 +49,7 @@ def cleanup_files(files):
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "exam-web-converter-offline"}
-
-import fitz
-from concurrent.futures import ProcessPoolExecutor
-from docxcompose.composer import Composer
-from docx import Document
-import io
-
-def convert_chunk(args):
-    input_pdf, output_docx, start_page, end_page = args
-    cv = Converter(input_pdf)
-    cv.convert(output_docx, start=start_page, end=end_page)
-    cv.close()
-    return output_docx
+    return {"status": "ok", "service": "exam-web-converter-googledrive"}
 
 @app.post("/api/v1/convert")
 def convert_file(
@@ -53,55 +59,53 @@ def convert_file(
     to_format: str = Form(alias="to")
 ):
     if from_format != "pdf" or to_format != "docx":
-        raise HTTPException(status_code=400, detail="Currently only PDF to DOCX is supported")
+        raise HTTPException(status_code=400, detail="Hiện tại chỉ hỗ trợ chuyển đổi từ PDF sang DOCX")
 
     file_id = str(uuid.uuid4())
     input_filename = f"{file_id}.pdf"
     output_filename = f"{file_id}.docx"
     input_path = os.path.join(TEMP_DIR, input_filename)
     output_path = os.path.join(TEMP_DIR, output_filename)
-    
+
     files_to_cleanup = [input_path, output_path]
+    drive_file_id = None
+    service = None
 
     try:
+        # 1. Lưu file PDF tải lên
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Count pages
-        doc = fitz.open(input_path)
-        num_pages = len(doc)
-        doc.close()
+        # 2. Khởi tạo Google Drive Service
+        service = get_drive_service()
 
-        if num_pages <= 3:
-            # For small files, just do it directly
-            cv = Converter(input_path)
-            cv.convert(output_path, multi_processing=True, cpu_count=4)
-            cv.close()
-        else:
-            # Split and process concurrently
-            chunk_size = 5
-            tasks = []
-            for i in range(0, num_pages, chunk_size):
-                end = min(i + chunk_size, num_pages)
-                chunk_out = os.path.join(TEMP_DIR, f"{file_id}_part_{i}.docx")
-                files_to_cleanup.append(chunk_out)
-                tasks.append((input_path, chunk_out, i, end))
+        # 3. Tải PDF lên Google Drive và nhờ nó OCR thành Google Docs
+        file_metadata = {
+            'name': file.filename,
+            'mimeType': 'application/vnd.google-apps.document'
+        }
+        media = MediaFileUpload(input_path, mimetype='application/pdf', resumable=True)
+        
+        uploaded_file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        ).execute()
 
-            # Run in parallel
-            with ProcessPoolExecutor(max_workers=4) as executor:
-                results = list(executor.map(convert_chunk, tasks))
+        drive_file_id = uploaded_file.get('id')
 
-            # Merge DOCX chunks
-            master = Document(results[0])
-            composer = Composer(master)
-            for res in results[1:]:
-                doc_part = Document(res)
-                composer.append(doc_part)
-            
-            composer.save(output_path)
+        # 4. Tải file Google Docs đó về dưới định dạng DOCX
+        request = service.files().export_media(fileId=drive_file_id, mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        fh = io.FileIO(output_path, 'wb')
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
 
+        # Xóa rác local
         background_tasks.add_task(cleanup_files, files_to_cleanup)
 
+        # Trả về file DOCX
         return FileResponse(
             path=output_path, 
             filename=f"converted_{file.filename}.docx",
@@ -110,4 +114,11 @@ def convert_file(
 
     except Exception as e:
         cleanup_files(files_to_cleanup)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Lỗi Convert: {str(e)}")
+    finally:
+        # 5. Luôn luôn xóa file trên Google Drive để tránh đầy 15GB
+        if service and drive_file_id:
+            try:
+                service.files().delete(fileId=drive_file_id).execute()
+            except:
+                pass
