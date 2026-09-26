@@ -32,6 +32,19 @@ def cleanup_files(files):
 def health_check():
     return {"status": "ok", "service": "exam-web-converter-offline"}
 
+import fitz
+from concurrent.futures import ProcessPoolExecutor
+from docxcompose.composer import Composer
+from docx import Document
+import io
+
+def convert_chunk(args):
+    input_pdf, output_docx, start_page, end_page = args
+    cv = Converter(input_pdf)
+    cv.convert(output_docx, start=start_page, end=end_page)
+    cv.close()
+    return output_docx
+
 @app.post("/api/v1/convert")
 def convert_file(
     background_tasks: BackgroundTasks,
@@ -40,26 +53,54 @@ def convert_file(
     to_format: str = Form(alias="to")
 ):
     if from_format != "pdf" or to_format != "docx":
-        raise HTTPException(status_code=400, detail="Currently only PDF to DOCX is supported by this microservice")
+        raise HTTPException(status_code=400, detail="Currently only PDF to DOCX is supported")
 
     file_id = str(uuid.uuid4())
     input_filename = f"{file_id}.pdf"
     output_filename = f"{file_id}.docx"
     input_path = os.path.join(TEMP_DIR, input_filename)
     output_path = os.path.join(TEMP_DIR, output_filename)
+    
+    files_to_cleanup = [input_path, output_path]
 
     try:
-        # Save uploaded file
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Convert purely offline using pdf2docx
-        cv = Converter(input_path)
-        cv.convert(output_path)
-        cv.close()
+        # Count pages
+        doc = fitz.open(input_path)
+        num_pages = len(doc)
+        doc.close()
 
-        # Schedule cleanup after response
-        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        if num_pages <= 3:
+            # For small files, just do it directly
+            cv = Converter(input_path)
+            cv.convert(output_path, multi_processing=True, cpu_count=4)
+            cv.close()
+        else:
+            # Split and process concurrently
+            chunk_size = 5
+            tasks = []
+            for i in range(0, num_pages, chunk_size):
+                end = min(i + chunk_size, num_pages)
+                chunk_out = os.path.join(TEMP_DIR, f"{file_id}_part_{i}.docx")
+                files_to_cleanup.append(chunk_out)
+                tasks.append((input_path, chunk_out, i, end))
+
+            # Run in parallel
+            with ProcessPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(convert_chunk, tasks))
+
+            # Merge DOCX chunks
+            master = Document(results[0])
+            composer = Composer(master)
+            for res in results[1:]:
+                doc_part = Document(res)
+                composer.append(doc_part)
+            
+            composer.save(output_path)
+
+        background_tasks.add_task(cleanup_files, files_to_cleanup)
 
         return FileResponse(
             path=output_path, 
@@ -68,5 +109,5 @@ def convert_file(
         )
 
     except Exception as e:
-        cleanup_files([input_path, output_path])
+        cleanup_files(files_to_cleanup)
         raise HTTPException(status_code=500, detail=str(e))
