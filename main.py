@@ -6,6 +6,7 @@ import shutil
 import uuid
 import sys
 from pdf_to_docx_google import split_pdf, convert_pdf_to_docx_google, merge_docx
+import json
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -25,10 +26,17 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Initialize Google Drive Service
 try:
-    creds_path = os.path.join(os.path.dirname(__file__), "google-credentials.json")
-    creds = service_account.Credentials.from_service_account_file(
-        creds_path, scopes=['https://www.googleapis.com/auth/drive']
-    )
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        creds_dict = json.loads(creds_json)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict, scopes=['https://www.googleapis.com/auth/drive']
+        )
+    else:
+        creds_path = os.path.join(os.path.dirname(__file__), "google-credentials.json")
+        creds = service_account.Credentials.from_service_account_file(
+            creds_path, scopes=['https://www.googleapis.com/auth/drive']
+        )
     drive_service = build('drive', 'v3', credentials=creds)
 except Exception as e:
     print(f"Error initializing Google Drive API: {e}")
