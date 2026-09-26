@@ -41,20 +41,28 @@ def convert_pdf_to_docx_google(pdf_path, drive_service):
         'name': os.path.basename(pdf_path),
         'mimeType': 'application/vnd.google-apps.document'
     }
+    
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+    if folder_id:
+        file_metadata['parents'] = [folder_id]
+        
     media = MediaFileUpload(pdf_path, mimetype='application/pdf', resumable=True)
     
     # Upload
     file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     file_id = file.get('id')
     
-    # Download as DOCX
-    request = drive_service.files().export_media(fileId=file_id, mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-    docx_content = request.execute()
-    
-    # Delete from Drive
-    drive_service.files().delete(fileId=file_id).execute()
-    
-    return docx_content
+    try:
+        # Download as DOCX
+        request = drive_service.files().export_media(fileId=file_id, mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        docx_content = request.execute()
+        return docx_content
+    finally:
+        # ALWAYS Delete from Drive, even if export fails
+        try:
+            drive_service.files().delete(fileId=file_id).execute()
+        except:
+            pass
 
 def merge_docx(docx_contents, output_path):
     """Merges multiple DOCX contents into a single file."""
